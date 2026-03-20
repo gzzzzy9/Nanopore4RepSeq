@@ -102,77 +102,108 @@ def render_log_table(df: pd.DataFrame):
     """
     st.markdown(html, unsafe_allow_html=True)
 
-def parse_log_to_df(sample_table_path: str) -> pd.DataFrame:
-    """只读 sample_table 生成基准表，不读日志"""
+def parse_log_to_df(sample_table_path: str, log_path: str) -> pd.DataFrame:
+    """读 sample_table 生成基准表，再用日志填充时间和状态"""
     df = pd.read_csv(sample_table_path, header=0)
     df.columns = ["library", "barcode", "isotype", "species"]
     df["time"] = "—"
     df["status"] = "pending"
+
+    if not os.path.exists(log_path):
+        return df
+
+    processed = {}
+    with open(log_path, "r") as f:
+        lines = f.readlines()
+
+    for i, line in enumerate(lines):
+        m = LOG_PATTERN.search(line.strip())
+        if m:
+            timestamp, library, barcode, isotype, species = m.groups()
+            time_short = re.search(r"\d{2}:\d{2}:\d{2}", timestamp).group()
+            key = (library, barcode)
+            is_last = not any(LOG_PATTERN.search(l.strip()) for l in lines[i+1:])
+            processed[key] = {
+                "time": time_short,
+                "status": "running" if is_last else "done"
+            }
+
+    for idx, row in df.iterrows():
+        key = (row["library"], row["barcode"])
+        if key in processed:
+            df.at[idx, "time"] = processed[key]["time"]
+            df.at[idx, "status"] = processed[key]["status"]
+
     return df
 
 
-def tail_slurm_log(log_path, job_id, sample_table_path):
+def tail_slurm_log(log_path, job_id):
     st.info(f"📡 监听日志: `{log_path}`  |  Job ID: `{job_id}`")
 
     table_placeholder = st.empty()
     status_placeholder = st.empty()
 
-    # 等待日志文件出现
+    log_file_exist = False
     for _ in range(60):
         if os.path.exists(log_path):
+            status_placeholder.empty()
+            log_file_exist = True
             break
         status_placeholder.warning("⏳ 等待日志文件生成...")
         time.sleep(1)
-    else:
+
+    if not log_file_exist:
         st.error("❌ 日志文件未出现")
         return
 
-    # 基准表
-    df = parse_log_to_df(sample_table_path)
+    rows = []
+
+    def is_job_running(job_id):
+        check = subprocess.run(
+            f"squeue -j {job_id} -h -o '%T'",  # 只输出状态字段
+            shell=True, capture_output=True, text=True
+        )
+        state = check.stdout.strip()
+        # PENDING/RUNNING 都算还在跑
+        return state in ("RUNNING", "PENDING", "R", "PD")
 
     with open(log_path, "r") as f:
-        last_key = None
         while True:
             line = f.readline()
             if line:
+                # 有内容就继续读，不要跳到 else
                 m = LOG_PATTERN.search(line.strip())
                 if m:
                     timestamp, library, barcode, isotype, species = m.groups()
                     time_short = re.search(r"\d{2}:\d{2}:\d{2}", timestamp).group()
-                    key = (library, barcode)
 
-                    # 把上一个 running 改成 done
-                    if last_key and last_key != key:
-                        df.loc[
-                            (df["library"] == last_key[0]) & (df["barcode"] == last_key[1]),
-                            "status"
-                        ] = "done"
+                    if rows and rows[-1]["status"] == "running":
+                        rows[-1]["status"] = "done"
 
-                    # 更新当前行为 running
-                    mask = (df["library"] == library) & (df["barcode"] == barcode)
-                    df.loc[mask, "time"] = time_short
-                    df.loc[mask, "status"] = "running"
-                    last_key = key
+                    rows.append({
+                        "time": time_short,
+                        "library": library,
+                        "barcode": barcode,
+                        "isotype": isotype,
+                        "species": species,
+                        "status": "running"
+                    })
 
-                    # 立刻刷新表格
                     with table_placeholder.container():
-                        render_log_table(df)
+                        render_log_table(pd.DataFrame(rows))
 
             else:
-                # 检查 job 是否结束
-                check = subprocess.run(
-                    f"squeue -j {job_id} -h",
-                    shell=True, capture_output=True, text=True
-                )
-                if check.stdout.strip() == "":
-                    # job 结束，把最后一个 running 改成 done
-                    df.loc[df["status"] == "running", "status"] = "done"
+                # 真正没有新行了，再检查 job 状态
+                if not is_job_running(job_id):
+                    if rows and rows[-1]["status"] == "running":
+                        rows[-1]["status"] = "done"
                     with table_placeholder.container():
-                        render_log_table(df)
+                        render_log_table(pd.DataFrame(rows))
                     status_placeholder.success("✅ Job 已完成！")
                     break
                 time.sleep(3)
-
+                
+                
 st.markdown("# ⚙️ Main")
 if st.button("🚀 Run MiXCR pipeline"):
     os.makedirs("slurms_out", exist_ok=True)
@@ -197,8 +228,7 @@ if st.button("🚀 Run MiXCR pipeline"):
         if res.returncode == 0:
             job_id = res.stdout.strip().split()[-1]
             st.success(f"✅ Submitted! Job ID: `{job_id}`")
-            sample_table_path = os.path.join(input_dir, "sample_table.csv")
-            tail_slurm_log(log_path, job_id, sample_table_path)
+            tail_slurm_log(log_path, job_id)
         else:
             st.error(f"❌ Fail：{res.stderr}")
 

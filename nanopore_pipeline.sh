@@ -1,6 +1,6 @@
 #!/usr/bin/sh
 #SBATCH -n 10
-#SBATCH -p CPU2
+#SBATCH -p CPU3
 #SBATCH -o pipeline_out.txt
 
 # activate conda env
